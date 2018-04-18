@@ -66,6 +66,7 @@
 //------------------------------------------------------------------------------------------
 #pragma comment(lib, "ws2_32.lib")
 #pragma warning(disable:4996)
+#define BOOST_CONFIG_SUPPRESS_OUTDATED_MESSAGE
 #include <boost/thread.hpp>
 #include <WinSock2.h>
 #include <Windows.h>
@@ -76,9 +77,14 @@
 #include "../src/main/cpp/testProtocol_generated.h"
 #include <flatbuffers\util.h>
 
+//내가 만든 헤더
+#include "myLogIO.h"
+
 #include <iostream>
 #include <cstdlib>
 #include <cstdio>
+#include <list>
+#include <process.h>
 
 using namespace std;
 
@@ -89,7 +95,9 @@ DWORD WINAPIWorkerThread(LPVOID arg);
 
 void errLog(char* msg);
 
+
 //소켓정보 저장을 위한 구조체<이게 flatbuffer가 해주는 일 아닌가?
+typedef enum IO_TYPE { IO_READ, IO_ACCEPT };
 struct SOCKETINFO
 {
 	OVERLAPPED overlapped;
@@ -97,14 +105,22 @@ struct SOCKETINFO
 	char buf[BUFSIZE + 1];
 	int recvbytes;
 	int sendbytes;
+	IO_TYPE    io_type;
 	WSABUF wsabuf;
 };
 
 void myIP();
 
+CRITICAL_SECTION g_cs;
+
+myLogIO* g_Log = new myLogIO();
+
 int main()
 {
 	myIP();
+
+	boost::thread writeLogThread(boost::bind(&myLogIO::WriteLog, g_Log));
+
 
 	int retval;
 
@@ -121,7 +137,7 @@ int main()
 
 	//flatbufferbuilder 생성
 	flatbuffers::FlatBufferBuilder builder;
-	
+
 	//입출력 포트 생성
 	HANDLE hcp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
 	if (hcp == NULL) { return 1; }
@@ -131,12 +147,11 @@ int main()
 	GetSystemInfo(&si);
 
 	boost::thread* th = new boost::thread[(int)si.dwNumberOfProcessors];
-	cout << "CPU Count : " << (int)si.dwNumberOfProcessors <<  endl;
-	for (int i = 0; i  < (int)si.dwNumberOfProcessors; i++)
+	cout << "CPU Count : " << (int)si.dwNumberOfProcessors << endl;
+	for (int i = 0; i < (int)si.dwNumberOfProcessors; i++)
 	{
 		th[i] = boost::thread(boost::bind(WINAPIWorkerThread, hcp));
 		//if (th[i] == nullptr) { return 1; }
-
 		//cout << "thread number : [ " << i << " ] " << endl;
 	}
 
@@ -184,6 +199,7 @@ int main()
 
 		//소켓과 입출력 완료 포트 연결
 		//accept()함수가 리턴한 소켓(client_sock)을 [입출력 오나료 포트]와 연결
+		cout << "Accept Complite" << endl;
 		CreateIoCompletionPort((HANDLE)client_sock, hcp, client_sock, 0);
 
 		//소켓 정보 구조체 할당
@@ -195,6 +211,7 @@ int main()
 		ptr->recvbytes = ptr->sendbytes = 0;
 		ptr->wsabuf.buf = ptr->buf;
 		ptr->wsabuf.len = BUFSIZE;
+		ptr->io_type = IO_ACCEPT;
 
 		//비동기 입출력 시작 (WSARecv 호출)
 		flags = 0;
@@ -245,18 +262,23 @@ int main()
 
 DWORD WINAPIWorkerThread(LPVOID arg)
 {
-	int retval;
-
 	HANDLE hcp = (HANDLE)arg;
+	int retval;
+	int cnt = 0;
+	DWORD cbTransferred;
+	SOCKET client_sock;
+	SOCKETINFO *ptr = NULL;
 
 	while (1)
 	{
 		//비동기 입출력 완료 기다리기 (GetQueuedCompletionSatus 함수 호출)
-		DWORD cbTransferred;
-		SOCKET client_sock;
-		SOCKETINFO *ptr;
 
-		retval = GetQueuedCompletionStatus(hcp, &cbTransferred, &client_sock, (LPOVERLAPPED*)&ptr, INFINITE);
+
+		retval = GetQueuedCompletionStatus(hcp, &cbTransferred, &client_sock, (LPOVERLAPPED *)&ptr, INFINITE);
+
+		cout << "recivebyte : [" << ptr->recvbytes << "]" << endl;
+		cout << "sendbyte : [" << ptr->sendbytes << "]" << endl;
+
 		SOCKADDR_IN clientaddr;
 		int addrlen = sizeof(clientaddr);
 		getpeername(ptr->sock, (SOCKADDR*)&clientaddr, &addrlen);
@@ -307,42 +329,60 @@ DWORD WINAPIWorkerThread(LPVOID arg)
 			DWORD sendbytes;
 			//WSASend() 함수는 비동기적으로 동작하기 때문에, 실제 보낸 데이터 수는 다음 루프 때 확인이 가능하다고 한다. 206행
 			retval = WSASend(ptr->sock, &ptr->wsabuf, 1, &sendbytes, 0, &ptr->overlapped, NULL);
-			if (retval == SOCKET_ERROR) {
-				if (WSAGetLastError() != WSA_IO_PENDING) {
-					{
-						char errormsg[] = "WSASend()";
-						errLog(errormsg);
-					}
-				}
-				continue;
-			}
-			else
-			{
-				ptr->recvbytes = 0;
-				//데이터 받기
-				//소켓 정보 중 받은 데이터 수를 초기화 한 후
-				ZeroMemory(&ptr->overlapped, sizeof(ptr->overlapped));
-				ptr->wsabuf.buf = ptr->buf;
-				ptr->wsabuf.len = BUFSIZE;
+			
 
-				DWORD recvbytes;
-				DWORD flags = 0;
-				//도착한 데이터를 읽음
-				//WSARecv()함수도 비동기 이므로, 다음 루프 시 확인 가능 -> 198행 코드
-				retval = WSARecv(ptr->sock, &ptr->wsabuf, 1, &recvbytes, &flags, &ptr->overlapped, NULL);
+			try {
+				throw true;
 				if (retval == SOCKET_ERROR) {
-					if (WSAGetLastError() != WSA_IO_PENDING)
-					{
+					if (WSAGetLastError() != WSA_IO_PENDING) {
 						{
-							char errormsg[] = "WSARecv()";
+							char errormsg[] = "WSASend()";
 							errLog(errormsg);
 						}
 					}
 					continue;
 				}
 			}
+			catch (bool test)
+			{
+				if (test)
+				{
+					for (int i = 0; i < 100; i++)
+					{
+						char errormsg[] = "WSASend()";
+						errLog(errormsg);
+					}
+				}
+			}
+			
 		}
+		else
+		{
+			cout << "in clear" << endl;
+			ptr->recvbytes = 0;
+			//데이터 받기
+			//소켓 정보 중 받은 데이터 수를 초기화 한 후
+			ZeroMemory(&ptr->overlapped, sizeof(ptr->overlapped));
+			ptr->wsabuf.buf = ptr->buf;
+			ptr->wsabuf.len = BUFSIZE;
 
+			DWORD recvbytes;
+			DWORD flags = 0;
+			//도착한 데이터를 읽음
+			//WSARecv()함수도 비동기 이므로, 다음 루프 시 확인 가능 -> 198행 코드
+			retval = WSARecv(ptr->sock, &ptr->wsabuf, 1, &recvbytes, &flags, &ptr->overlapped, NULL);
+			if (retval == SOCKET_ERROR) {
+				if (WSAGetLastError() != WSA_IO_PENDING)
+				{
+					{
+						char errormsg[] = "WSARecv()";
+						errLog(errormsg);
+					}
+				}
+				continue;
+			}
+			cnt++;
+		}
 
 	}
 	puts("Inner Thread");
@@ -359,6 +399,7 @@ void myIP()
 	char ipaddr[50];
 
 	memset(hostname, 0, sizeof(hostname));
+	memset(hostname, 0, sizeof(hostname));
 	memset(ipaddr, 0, sizeof(ipaddr));
 
 	int nError = gethostname(hostname, sizeof(hostname));
@@ -374,5 +415,5 @@ void myIP()
 
 void errLog(char* msg)
 {
-
+	g_Log->PushMessage(msg);
 }
